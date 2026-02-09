@@ -15,14 +15,13 @@
     let processName = 'PRS'; 
     let selectedDate = new Date().toISOString().split('T')[0];
 
-    $: processName = $page.url.searchParams.get('process') || 'PRS';
+    $: processName = $page.url.searchParams.get('process') || 'PRESSING';
     $: urlDate = $page.url.searchParams.get('tanggal');
 
     // Jika ada tanggal di URL, gunakan itu
     $: if (urlDate) selectedDate = urlDate;
 
     function goBack() {
-        // Hanya Manager yang boleh kembali
         if ($auth.user?.role === 'MANAGER') {
             goto('/manager');
         }
@@ -51,39 +50,50 @@
 
     async function fetchMachineStatus() {
         isLoading = true;
+        machineData = []; // Reset data
         try {
+            console.log(`Fetching Process: ${processName} Date: ${selectedDate}`);
+            
             const res = await fetch(`${API_URL}/api/chart/process?tanggal=${selectedDate}&proses=${processName}`, {
                 headers: { Authorization: `Bearer ${$auth.token}` }
             });
+            
             if (res.ok) {
                 const data = await res.json();
-                machineData = data.map((item: any) => {
-                    const target = Math.round(item.target || 0);
-                    const actual = Math.round(item.actual || 0);
-                    const ng = Math.round(item.actual_ng || 0);
+                console.log("Data diterima:", data); // DEBUG: Cek di Console Browser
 
-                    const achievement = target > 0 ? (actual / target) * 100 : 0;
-                    const ngRate = (actual + ng) > 0 ? (ng / (actual + ng)) * 100 : 0;
+                if (Array.isArray(data)) {
+                    machineData = data.map((item: any) => {
+                        // FIX: Handle omitempty / null / undefined -> 0
+                        const target = Math.round(item.target || 0);
+                        const actual = Math.round(item.actual || 0);
+                        const ng = Math.round(item.actual_ng || 0);
 
-                    return {
-                        id: item.label,
-                        name: `Mesin ${item.label}`,
-                        target: target,
-                        completed: actual,
-                        notGood: ng,
-                        isProblem: achievement < 80 || ngRate > 5 
-                    };
-                });
+                        const achievement = target > 0 ? (actual / target) * 100 : 0;
+                        const ngRate = (actual + ng) > 0 ? (ng / (actual + ng)) * 100 : 0;
+
+                        return {
+                            id: item.label,
+                            name: `Mesin ${item.label}`,
+                            target: target,
+                            completed: actual,
+                            notGood: ng,
+                            isProblem: achievement < 80 || ngRate > 5 
+                        };
+                    });
+                }
             }
         } catch (e) {
             console.error("Gagal ambil data mesin:", e);
         } finally {
             isLoading = false;
+            // Beri sedikit delay agar DOM render dulu sebelum Chart.js init
             setTimeout(initializeCharts, 100);
         }
     }
 
     function initializeCharts() {
+        // Hapus chart lama
         Object.keys(charts).forEach(machineId => {
             if (charts[machineId]?.total) charts[machineId].total.destroy();
             if (charts[machineId]?.notGood) charts[machineId].notGood.destroy();
@@ -91,8 +101,7 @@
         charts = {};
 
         machineData.forEach((machine) => {
-            const machineTarget = machine.target; 
-            // Agar skala grafik pas, kita beri ruang di atas nilai tertinggi
+            const machineTarget = machine.target || 10; // Default skala jika 0
             const maxScale = Math.max(machineTarget, machine.completed) + 10;
 
             // --- Chart Total Produksi ---
@@ -100,72 +109,58 @@
             const totalCanvas = document.getElementById(totalCanvasId) as HTMLCanvasElement;
             
             if (totalCanvas) {
-                const ctx = totalCanvas.getContext('2d');
-                if (ctx) {
-                    const gradient = ctx.createLinearGradient(0, 0, 0, totalCanvas.height);
-                    gradient.addColorStop(0, '#3b82f6');
-                    gradient.addColorStop(1, '#1d4ed8');
-
-                    const newChart = new Chart(totalCanvas, {
-                        type: 'bar',
-                        data: {
-                            labels: ['Produksi'],
-                            datasets: [{
-                                label: 'Produksi',
-                                data: [machine.completed],
-                                backgroundColor: gradient,
-                                borderColor: '#1e40af',
-                                borderWidth: 1,
-                                borderRadius: 6
-                            }]
-                        },
-                        options: {
-                            responsive: true,
-                            maintainAspectRatio: false,
-                            plugins: {
-                                legend: { display: false },
-                                annotation: {
-                                    annotations: {
-                                        targetLine: {
-                                            type: 'line',
-                                            yMin: machineTarget,
-                                            yMax: machineTarget,
-                                            borderColor: '#10b981',
-                                            borderWidth: 2,
-                                            borderDash: [5, 5],
-                                            label: {
-                                                content: `Target: ${machineTarget}`,
-                                                display: true,
-                                                position: 'end',
-                                                backgroundColor: '#10b981',
-                                                color: 'white',
-                                                font: { size: 9, weight: 'bold' },
-                                                padding: 4,
-                                                borderRadius: 4
-                                            }
+                const newChart = new Chart(totalCanvas, {
+                    type: 'bar',
+                    data: {
+                        labels: ['Produksi'],
+                        datasets: [{
+                            label: 'Produksi',
+                            data: [machine.completed],
+                            backgroundColor: '#3b82f6',
+                            borderColor: '#1e40af',
+                            borderWidth: 1,
+                            borderRadius: 6
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {
+                            legend: { display: false },
+                            annotation: {
+                                annotations: {
+                                    targetLine: {
+                                        type: 'line',
+                                        yMin: machine.target,
+                                        yMax: machine.target,
+                                        borderColor: '#10b981',
+                                        borderWidth: 2,
+                                        borderDash: [5, 5],
+                                        label: {
+                                            content: `Target: ${machine.target}`,
+                                            display: true,
+                                            position: 'end',
+                                            backgroundColor: '#10b981',
+                                            color: 'white',
+                                            font: { size: 9, weight: 'bold' }
                                         }
                                     }
                                 }
-                            },
-                            scales: {
-                                y: {
-                                    beginAtZero: true,
-                                    suggestedMax: maxScale, 
-                                    ticks: { 
-                                        font: { size: 9 }, 
-                                        color: '#64748b', 
-                                        stepSize: 1, // FIXED: Integer only
-                                        precision: 0
-                                    },
-                                    border: { display: false }
-                                },
-                                x: { display: false }
                             }
+                        },
+                        scales: {
+                            y: {
+                                beginAtZero: true,
+                                max: maxScale, 
+                                ticks: { font: { size: 9 }, stepSize: 1 },
+                                display: true
+                            },
+                            x: { display: false }
                         }
-                    });
-                    if (!charts[machine.id]) charts[machine.id] = {};
-                    charts[machine.id].total = newChart;
-                }
+                    }
+                });
+                if (!charts[machine.id]) charts[machine.id] = {};
+                charts[machine.id].total = newChart;
             }
 
             // --- Chart Not Good ---
@@ -173,78 +168,41 @@
             const notGoodCanvas = document.getElementById(notGoodCanvasId) as HTMLCanvasElement;
             
             if (notGoodCanvas) {
-                const ctx = notGoodCanvas.getContext('2d');
-                if (ctx) {
-                    const gradient = ctx.createLinearGradient(0, 0, 0, notGoodCanvas.height);
-                    gradient.addColorStop(0, '#ef4444');
-                    gradient.addColorStop(1, '#dc2626');
-
-                    const maxNG = Math.ceil(machineTarget * 0.05);
-                    const newChart = new Chart(notGoodCanvas, {
-                        type: 'bar',
-                        data: {
-                            labels: ['NG'],
-                            datasets: [{
-                                label: 'NG',
-                                data: [machine.notGood],
-                                backgroundColor: gradient,
-                                borderColor: '#b91c1c',
-                                borderWidth: 1,
-                                borderRadius: 6
-                            }]
-                        },
-                        options: {
-                            responsive: true,
-                            maintainAspectRatio: false,
-                            plugins: {
-                                legend: { display: false },
-                                annotation: {
-                                    annotations: {
-                                        limitLine: {
-                                            type: 'line',
-                                            yMin: maxNG,
-                                            yMax: maxNG,
-                                            borderColor: '#f59e0b',
-                                            borderWidth: 1,
-                                            borderDash: [2, 2],
-                                            label: {
-                                                content: `Max: ${maxNG}`,
-                                                display: true,
-                                                position: 'start',
-                                                backgroundColor: '#f59e0b',
-                                                color: 'white',
-                                                font: { size: 8 },
-                                                padding: 2,
-                                                borderRadius: 2
-                                            }
-                                        }
-                                    }
-                                }
+                const maxNG = Math.ceil(machineTarget * 0.05) || 5;
+                const newChart = new Chart(notGoodCanvas, {
+                    type: 'bar',
+                    data: {
+                        labels: ['NG'],
+                        datasets: [{
+                            label: 'NG',
+                            data: [machine.notGood],
+                            backgroundColor: '#ef4444',
+                            borderColor: '#b91c1c',
+                            borderWidth: 1,
+                            borderRadius: 6
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: { legend: { display: false } },
+                        scales: {
+                            y: {
+                                beginAtZero: true,
+                                suggestedMax: Math.max(machine.notGood, maxNG) + 5, 
+                                ticks: { font: { size: 9 }, stepSize: 1 },
+                                display: true
                             },
-                            scales: {
-                                y: {
-                                    beginAtZero: true,
-                                    suggestedMax: Math.max(machine.notGood, maxNG) + 5, 
-                                    ticks: { 
-                                        font: { size: 9 }, 
-                                        color: '#64748b', 
-                                        stepSize: 1,
-                                        precision: 0 
-                                    },
-                                    border: { display: false }
-                                },
-                                x: { display: false }
-                            }
+                            x: { display: false }
                         }
-                    });
-                    if (!charts[machine.id]) charts[machine.id] = {};
-                    charts[machine.id].notGood = newChart;
-                }
+                    }
+                });
+                if (!charts[machine.id]) charts[machine.id] = {};
+                charts[machine.id].notGood = newChart;
             }
         });
     }
 
-    // Filter Logic untuk Layout
     $: pressMachines = machineData.filter(m => !['20A', '21A', '22A', '19A', '18A', '17A'].includes(m.id));
     $: injectMachines = machineData.filter(m => ['20A', '21A', '22A', '19A', '18A', '17A'].includes(m.id));
 
@@ -276,8 +234,7 @@
                         Kembali
                     </button>
                 {/if}
-                <h1 class="text-2xl md:text-3xl font-bold text-slate-800">Department Dashboard: {processName}</h1>
-                <p class="text-slate-600 mt-1 text-sm md:text-base">Pantau status mesin secara real-time</p>
+                <h1 class="text-2xl md:text-3xl font-bold text-slate-800">Dashboard: {processName}</h1>
             </div>
 
             <div class="bg-white p-2 rounded-lg shadow-sm border border-slate-200 flex items-center gap-2">
@@ -294,21 +251,28 @@
         {#if isLoading}
             <div class="flex justify-center items-center min-h-64 bg-white rounded-2xl shadow-lg border border-slate-200">
                 <div class="text-center">
-                    <div class="inline-block animate-spin">
-                        <i class="fa-solid fa-spinner text-indigo-600 text-4xl"></i>
-                    </div>
-                    <p class="text-slate-600 mt-4">Memuat data mesin...</p>
+                    <i class="fa-solid fa-spinner animate-spin text-indigo-600 text-4xl"></i>
+                    <p class="text-slate-600 mt-4">Memuat data...</p>
                 </div>
+            </div>
+        {:else if machineData.length === 0}
+            <div class="flex flex-col justify-center items-center min-h-64 bg-white rounded-2xl shadow-lg border border-slate-200 p-8">
+                <div class="bg-slate-100 p-4 rounded-full mb-4">
+                    <i class="fa-solid fa-database text-slate-400 text-4xl"></i>
+                </div>
+                <h3 class="text-xl font-bold text-slate-700">Tidak Ada Data</h3>
+                <p class="text-slate-500 text-center mt-2 max-w-md">
+                    Tidak ditemukan data produksi untuk proses <b>{processName}</b> pada tanggal <b>{selectedDate}</b>.
+                </p>
+                <p class="text-xs text-slate-400 mt-4">Pastikan nama proses di database sesuai (Misal: PRESSING vs PRS)</p>
             </div>
         {:else}
             <div class="bg-white rounded-2xl shadow-lg p-4 md:p-6 border border-slate-200">
-                <h2 class="text-lg font-bold text-slate-800 mb-6">Layout Pabrik</h2>
-
+                <h2 class="text-lg font-bold text-slate-800 mb-6">Status Mesin</h2>
                 <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
                     <div>
                         <h3 class="text-xs font-bold text-slate-600 mb-4 uppercase tracking-wider flex items-center gap-2">
-                            <span class="w-2 h-2 bg-purple-500 rounded-full"></span>
-                            Mesin Tipe A
+                            <span class="w-2 h-2 bg-purple-500 rounded-full"></span> Mesin Group A
                         </h3>
                         <div class="space-y-4">
                             {#each injectMachines as machine}
@@ -323,46 +287,22 @@
                                             <div class="font-semibold text-slate-800 truncate">{machine.name}</div>
                                             <div class="text-xs text-slate-600 flex items-center gap-1">
                                                 <span class="w-2 h-2 bg-blue-500 rounded-full"></span>
-                                                {machine.completed} / {machine.target} pcs
+                                                {machine.completed} / {machine.target}
                                             </div>
                                         </div>
                                         <i class="fa-solid fa-arrow-right text-slate-400"></i>
                                     </button>
-
                                     <div class="px-4 pb-4 pt-2 border-t border-slate-200/50 space-y-4">
-                                        <div>
-                                            <div class="flex justify-between items-center mb-2">
-                                                <span class="text-xs font-semibold text-slate-700 flex items-center gap-1">
-                                                    <i class="fa-solid fa-chart-bar text-blue-500"></i>
-                                                    Total Produksi
-                                                </span>
-                                                <span class="text-sm font-bold {machine.completed >= machine.target ? 'text-green-600' : 'text-orange-600'}">
-                                                    {machine.completed}
-                                                </span>
-                                            </div>
-                                            <div class="h-32"><canvas id="chart-total-{machine.id}"></canvas></div>
-                                        </div>
-                                        
-                                        <div>
-                                            <div class="flex justify-between items-center mb-2">
-                                                <span class="text-xs font-semibold text-slate-700 flex items-center gap-1">
-                                                    <i class="fa-solid fa-triangle-exclamation text-red-500"></i>
-                                                    Not Good
-                                                </span>
-                                                <span class="text-sm font-bold text-red-600">{machine.notGood}</span>
-                                            </div>
-                                            <div class="h-32"><canvas id="chart-notgood-{machine.id}"></canvas></div>
-                                        </div>
+                                        <div class="h-32"><canvas id="chart-total-{machine.id}"></canvas></div>
+                                        <div class="h-32"><canvas id="chart-notgood-{machine.id}"></canvas></div>
                                     </div>
                                 </div>
                             {/each}
                         </div>
                     </div>
-
                     <div>
                         <h3 class="text-xs font-bold text-slate-600 mb-4 uppercase tracking-wider flex items-center gap-2">
-                            <span class="w-2 h-2 bg-blue-500 rounded-full"></span>
-                            Mesin Tipe B
+                            <span class="w-2 h-2 bg-blue-500 rounded-full"></span> Mesin Group B
                         </h3>
                         <div class="space-y-4">
                             {#each pressMachines as machine}
@@ -377,36 +317,14 @@
                                             <div class="font-semibold text-slate-800 truncate">{machine.name}</div>
                                             <div class="text-xs text-slate-600 flex items-center gap-1">
                                                 <span class="w-2 h-2 bg-blue-500 rounded-full"></span>
-                                                {machine.completed} / {machine.target} pcs
+                                                {machine.completed} / {machine.target}
                                             </div>
                                         </div>
                                         <i class="fa-solid fa-arrow-right text-slate-400"></i>
                                     </button>
-
                                     <div class="px-4 pb-4 pt-2 border-t border-slate-200/50 space-y-4">
-                                        <div>
-                                            <div class="flex justify-between items-center mb-2">
-                                                <span class="text-xs font-semibold text-slate-700 flex items-center gap-1">
-                                                    <i class="fa-solid fa-chart-bar text-blue-500"></i>
-                                                    Total Produksi
-                                                </span>
-                                                <span class="text-sm font-bold {machine.completed >= machine.target ? 'text-green-600' : 'text-orange-600'}">
-                                                    {machine.completed}
-                                                </span>
-                                            </div>
-                                            <div class="h-32"><canvas id="chart-total-{machine.id}"></canvas></div>
-                                        </div>
-                                        
-                                        <div>
-                                            <div class="flex justify-between items-center mb-2">
-                                                <span class="text-xs font-semibold text-slate-700 flex items-center gap-1">
-                                                    <i class="fa-solid fa-triangle-exclamation text-red-500"></i>
-                                                    Not Good
-                                                </span>
-                                                <span class="text-sm font-bold text-red-600">{machine.notGood}</span>
-                                            </div>
-                                            <div class="h-32"><canvas id="chart-notgood-{machine.id}"></canvas></div>
-                                        </div>
+                                        <div class="h-32"><canvas id="chart-total-{machine.id}"></canvas></div>
+                                        <div class="h-32"><canvas id="chart-notgood-{machine.id}"></canvas></div>
                                     </div>
                                 </div>
                             {/each}
