@@ -14,10 +14,13 @@
     let chartOK: Chart;
     let chartNG: Chart;
     
-    $: noMC = $page.url.searchParams.get('no_mc') || '01A';
+    // Default values
+    $: noMC = $page.url.searchParams.get('no_mc') || '';
     $: selectedDate = $page.url.searchParams.get('tanggal') || new Date().toISOString().split('T')[0];
     
     let filters = { tanggal: selectedDate, mesin: noMC };
+    
+    // Reactive sync
     $: { filters.tanggal = selectedDate; filters.mesin = noMC; }
 
     let itemsProduced = "-";
@@ -33,26 +36,47 @@
         goto(`/manager/mesin-detail?no_mc=${filters.mesin}&tanggal=${filters.tanggal}`, { replaceState: true });
     }
 
+    // --- FUNGSI UTAMA: Fetch List Mesin Sesuai Tanggal ---
     async function fetchMachineList() {
         try {
-            const res = await fetch(`${API_URL}/api/chart/machines`, {
+            // FIX: Kirim parameter tanggal
+            const res = await fetch(`${API_URL}/api/chart/machines?tanggal=${filters.tanggal}`, {
                 headers: { Authorization: `Bearer ${$auth.token}` }
             });
+
             if (res.ok) {
-                machineList = await res.json();
-                if (machineList.length > 0 && !noMC) {
-                    filters.mesin = machineList[0];
-                    updateFilters();
+                const newList = await res.json();
+                
+                // Jika hasil kosong (misal hari libur), jangan kosongkan total list,
+                // tapi biarkan user melihat list lama atau tampilkan pesan.
+                if (newList.length > 0) {
+                    machineList = newList;
+                    
+                    // Jika mesin yang dipilih sekarang TIDAK ada di list hari ini (misal mesin mati),
+                    // alihkan ke mesin pertama yang aktif agar grafik tidak error.
+                    if (filters.mesin && !machineList.includes(filters.mesin)) {
+                        // Opsional: Redirect otomatis atau biarkan user melihat "No Data"
+                        // filters.mesin = machineList[0];
+                        // updateFilters();
+                    } else if (!filters.mesin) {
+                        filters.mesin = machineList[0];
+                        updateFilters();
+                    }
+                } else {
+                    // Fallback jika tidak ada data sama sekali hari itu
+                    machineList = [];
                 }
             } else {
                 generateFallbackMachines();
             }
         } catch (e) {
+            console.error("Gagal load mesin:", e);
             generateFallbackMachines();
         }
     }
 
     function generateFallbackMachines() {
+        // Fallback hanya jika error sistem
         machineList = Array.from({length: 25}, (_, i) => `${(i + 1).toString().padStart(2, '0')}A`);
     }
 
@@ -60,13 +84,11 @@
         if (!filters.mesin) return;
         isLoading = true;
         try {
-            console.log(`Fetching Detail Mesin: ${filters.mesin} Date: ${filters.tanggal}`);
             const res = await fetch(`${API_URL}/api/chart/machine?tanggal=${filters.tanggal}&no_mc=${filters.mesin}`, {
                  headers: { Authorization: `Bearer ${$auth.token}` }
             });
             
             const data = await res.json();
-            console.log("Data Detail Diterima:", data);
 
             if (res.ok && Array.isArray(data) && data.length > 0) {
                 hasData = true;
@@ -76,22 +98,25 @@
             } else {
                 hasData = false;
                 itemsProduced = "Tidak ada data";
-                // Render chart kosong/hapus chart
-                if (chartTotal) chartTotal.destroy();
-                if (chartOK) chartOK.destroy();
-                if (chartNG) chartNG.destroy();
+                clearCharts();
             }
         } catch (error) {
-            console.error("Error fetching machine detail:", error);
+            console.error("Error fetching detail:", error);
             hasData = false;
+            clearCharts();
         } finally {
             isLoading = false;
         }
     }
 
+    function clearCharts() {
+        if (chartTotal) chartTotal.destroy();
+        if (chartOK) chartOK.destroy();
+        if (chartNG) chartNG.destroy();
+    }
+
     function renderCharts(data: any[]) {
         const labels = data.map((d: any) => d.label);
-        // FIX: Handle undefined values -> 0
         const totalVals = data.map((d: any) => d.actual || 0); 
         const okVals = data.map((d: any) => d.actual_ok || 0);
         const ngVals = data.map((d: any) => d.actual_ng || 0);
@@ -99,7 +124,6 @@
         const targetTotal = 30; 
         const targetNG = 5;
 
-        // --- CHART 1: Total ---
         if (chartTotal) chartTotal.destroy();
         chartTotal = new Chart(canvasTotal, {
             type: 'bar',
@@ -121,15 +145,12 @@
             }
         });
 
-        // --- CHART 2: OK ---
         if (chartOK) chartOK.destroy();
         chartOK = new Chart(canvasOK, {
             type: 'bar',
             data: {
                 labels: labels,
-                datasets: [
-                    { label: 'OK', data: okVals, backgroundColor: '#10b981', borderRadius: 4 }
-                ]
+                datasets: [ { label: 'OK', data: okVals, backgroundColor: '#10b981', borderRadius: 4 } ]
             },
             options: {
                 responsive: true,
@@ -142,7 +163,6 @@
             }
         });
 
-        // --- CHART 3: NG ---
         if (chartNG) chartNG.destroy();
         chartNG = new Chart(canvasNG, {
             type: 'bar',
@@ -165,11 +185,22 @@
         });
     }
 
-    $: if (noMC && selectedDate) loadChartData();
+    // Trigger Logic:
+    // 1. Saat komponen dimuat, fetch list mesin.
+    // 2. Saat tanggal berubah, fetch ulang list mesin (karena mesin aktif bisa beda).
+    // 3. Saat mesin berubah, load data chart.
+
+    $: if (filters.tanggal) {
+        fetchMachineList();
+        loadChartData(); // Reload chart juga karena tanggal ganti
+    }
+
+    $: if (filters.mesin) {
+        loadChartData();
+    }
 
     onMount(() => {
         fetchMachineList();
-        loadChartData();
     });
 </script>
 
@@ -185,16 +216,22 @@
         <div class="bg-white p-3 rounded-xl shadow-sm border border-slate-200 flex flex-wrap gap-3 items-center">
             <div class="flex flex-col">
                 <label class="text-[10px] font-bold text-slate-400 uppercase">Tanggal</label>
-                <input type="date" bind:value={filters.tanggal} on:change={updateFilters} class="text-sm font-bold text-slate-700 bg-transparent outline-none">
+                <input type="date" bind:value={filters.tanggal} on:change={updateFilters} class="text-sm font-bold text-slate-700 bg-transparent outline-none border-b border-transparent focus:border-indigo-500">
             </div>
+
             <div class="h-8 w-px bg-slate-200 mx-1"></div>
-            <div class="flex flex-col min-w-[80px]">
+
+            <div class="flex flex-col min-w-[100px]">
                 <label class="text-[10px] font-bold text-slate-400 uppercase">Pilih Mesin</label>
                 <div class="relative">
-                    <select bind:value={filters.mesin} on:change={updateFilters} class="w-full text-sm font-bold text-slate-700 bg-transparent outline-none appearance-none cursor-pointer pr-4">
-                        {#each machineList as mc}
-                            <option value={mc}>{mc}</option>
-                        {/each}
+                    <select bind:value={filters.mesin} on:change={updateFilters} class="w-full text-sm font-bold text-slate-700 bg-transparent outline-none appearance-none cursor-pointer pr-6">
+                        {#if machineList.length === 0}
+                            <option value="">Tidak ada mesin aktif</option>
+                        {:else}
+                            {#each machineList as mc}
+                                <option value={mc}>{mc}</option>
+                            {/each}
+                        {/if}
                     </select>
                     <i class="fa-solid fa-chevron-down absolute right-0 top-1 text-xs text-slate-400 pointer-events-none"></i>
                 </div>
@@ -214,14 +251,14 @@
         <div class="flex justify-center items-center h-64 bg-white rounded-lg shadow">
             <div class="text-center">
                 <i class="fa-solid fa-spinner animate-spin text-4xl text-blue-500"></i>
-                <p class="mt-4 text-gray-500 font-medium">Memuat data grafik...</p>
+                <p class="mt-4 text-gray-500 font-medium">Memuat data...</p>
             </div>
         </div>
     {:else if !hasData}
         <div class="flex flex-col justify-center items-center h-64 bg-white rounded-lg shadow p-8">
             <div class="bg-slate-100 p-4 rounded-full mb-3"><i class="fa-solid fa-chart-line text-slate-400 text-3xl"></i></div>
             <h3 class="text-lg font-bold text-slate-600">Tidak Ada Data</h3>
-            <p class="text-slate-500 text-sm mt-1">Belum ada data produksi untuk jam ini.</p>
+            <p class="text-slate-500 text-sm mt-1">Belum ada data produksi untuk mesin <b>{filters.mesin}</b> pada tanggal ini.</p>
         </div>
     {:else}
         <div class="space-y-6">

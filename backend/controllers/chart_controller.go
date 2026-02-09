@@ -4,29 +4,78 @@ import (
 	"graph/backend/database"
 	"graph/backend/models"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
 
-func GetManagerOverview(c *gin.Context) {
-	// Cek koneksi DB dulu
+// Helper: Cek koneksi DB
+func checkDB(c *gin.Context) bool {
 	if database.MySQL == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "MySQL Offline (Mode Testing)"})
-		return
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "MySQL Offline/Tidak Terhubung"})
+		return false
 	}
+	return true
+}
+
+// 1. MANAGER OVERVIEW
+// Karena tabel vtrx_lwp_prs kemungkinan besar khusus "Pressing",
+// kita hitung data dari tabel itu untuk divisi Pressing, sisanya 0 (kecuali ada tabel lain).
+func GetManagerOverview(c *gin.Context) {
+	if !checkDB(c) { return }
 
 	tanggal := c.Query("tanggal")
 	var results []models.ChartSeries
 
+	// Query khusus untuk Pressing berdasarkan tabel vtrx_lwp_prs
+	// Asumsi: qty_actual adalah Total Output, target diambil dari kolom target_jam
 	query := `
 		SELECT 
-			t.proses AS label,
-			COALESCE(SUM((TIME_TO_SEC(TIMEDIFF(t.SELESAI, t.MULAI)) / 3600.0) * s.tgtQtyPJam), 0) AS target,
-			COALESCE(SUM(t.Total), 0) AS actual
-		FROM vtrx_lwp_prs t
-		LEFT JOIN v_stdlot s ON t.moldcode = s.moldCode COLLATE utf8mb4_unicode_ci
-		WHERE t.tanggal = ?
-		GROUP BY t.proses
+			'PRESSING' AS label,
+			COALESCE(SUM(target_jam), 0) AS target,
+			COALESCE(SUM(qty_actual), 0) AS actual
+		FROM vtrx_lwp_prs 
+		WHERE tanggal = ?
+	`
+	// Kita buat variabel penampung sementara
+	var pressingData models.ChartSeries
+	
+	if err := database.MySQL.Raw(query, tanggal).Scan(&pressingData).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Masukkan data Pressing, dan dummy 0 untuk divisi lain (karena belum ada tabelnya)
+	results = append(results, 
+		models.ChartSeries{Label: "MIXING", Target: 0, Actual: 0},
+		models.ChartSeries{Label: "CUTTING", Target: 0, Actual: 0},
+		pressingData, // Data Asli dari MySQL
+		models.ChartSeries{Label: "FINISHING", Target: 0, Actual: 0},
+	)
+
+	c.JSON(http.StatusOK, results)
+}
+
+// 2. LEADER / PROCESS VIEW (Detail per Mesin)
+func GetLeaderProcessView(c *gin.Context) {
+	if !checkDB(c) { return }
+
+	tanggal := c.Query("tanggal")
+	// proses := c.Query("proses") // Sementara diabaikan karena tabelnya cuma satu (PRS)
+
+	var results []models.ChartSeries
+
+	// Grouping berdasarkan kolom 'mesin'
+	query := `
+		SELECT 
+			mesin AS label,
+			COALESCE(SUM(target_jam), 0) AS target,
+			COALESCE(SUM(qty_actual), 0) AS actual,
+			COALESCE(SUM(qty_ng), 0) AS actual_ng
+		FROM vtrx_lwp_prs
+		WHERE tanggal = ?
+		GROUP BY mesin
+		ORDER BY mesin
 	`
 
 	if err := database.MySQL.Raw(query, tanggal).Scan(&results).Error; err != nil {
@@ -37,79 +86,28 @@ func GetManagerOverview(c *gin.Context) {
 	c.JSON(http.StatusOK, results)
 }
 
-func GetLeaderProcessView(c *gin.Context) {
-	if database.MySQL == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "MySQL Offline (Mode Testing)"})
-		return
-	}
-
-	tanggal := c.Query("tanggal")
-	proses := c.Query("proses")
-	var results []models.ChartSeries
-
-	query := `
-		SELECT 
-			t.noMC AS label,
-			COALESCE(SUM((TIME_TO_SEC(TIMEDIFF(t.SELESAI, t.MULAI)) / 3600.0) * s.tgtQtyPJam), 0) AS target,
-			COALESCE(SUM(t.Total), 0) AS actual
-		FROM vtrx_lwp_prs t
-		LEFT JOIN v_stdlot s ON t.moldcode = s.moldCode COLLATE utf8mb4_unicode_ci
-		WHERE t.tanggal = ? AND t.proses = ?
-		GROUP BY t.noMC
-		ORDER BY t.noMC
-	`
-
-	if err := database.MySQL.Raw(query, tanggal, proses).Scan(&results).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	c.JSON(http.StatusOK, results)
-}
-
+// 3. MACHINE DETAIL (Detail per Jam)
 func GetMachineDetail(c *gin.Context) {
-	if database.MySQL == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "MySQL Offline (Mode Testing)"})
-		return
-	}
+	if !checkDB(c) { return }
 
 	tanggal := c.Query("tanggal")
 	noMC := c.Query("no_mc")
 	var results []models.ChartSeries
 
+	// Menggunakan kolom 'jam_ke' yang sudah ada di tabel, jauh lebih simpel!
+	// Kita asumsikan qty_actual adalah Total, jadi OK = Actual - NG.
 	query := `
-	WITH RECURSIVE 
-    jam_master AS (
-        SELECT 0 AS jam_angka
-        UNION ALL
-        SELECT jam_angka + 1 FROM jam_master WHERE jam_angka < 23
-    ),
-    raw_data AS (
-        SELECT 
-            t.tanggal, t.nama AS operator, t.MULAI, t.SELESAI,
-            s.itemName, s.tgtQtyPJam, j.jam_angka,
-            ROUND(t.Total * (GREATEST(0, TIME_TO_SEC(TIMEDIFF(LEAST(t.SELESAI, MAKETIME(j.jam_angka + 1, 0, 0)), GREATEST(t.MULAI, MAKETIME(j.jam_angka, 0, 0))))) / NULLIF(TIME_TO_SEC(TIMEDIFF(t.SELESAI, t.MULAI)), 0))) AS allocated_total,
-            ROUND(t.OK * (GREATEST(0, TIME_TO_SEC(TIMEDIFF(LEAST(t.SELESAI, MAKETIME(j.jam_angka + 1, 0, 0)), GREATEST(t.MULAI, MAKETIME(j.jam_angka, 0, 0))))) / NULLIF(TIME_TO_SEC(TIMEDIFF(t.SELESAI, t.MULAI)), 0))) AS allocated_ok,
-            ROUND(t.NG * (GREATEST(0, TIME_TO_SEC(TIMEDIFF(LEAST(t.SELESAI, MAKETIME(j.jam_angka + 1, 0, 0)), GREATEST(t.MULAI, MAKETIME(j.jam_angka, 0, 0))))) / NULLIF(TIME_TO_SEC(TIMEDIFF(t.SELESAI, t.MULAI)), 0))) AS allocated_ng
-        FROM vtrx_lwp_prs t
-        LEFT JOIN v_stdlot s ON t.moldcode = s.moldCode COLLATE utf8mb4_unicode_ci
-        CROSS JOIN jam_master j
-        WHERE 
-            t.tanggal = ? 
-            AND t.noMC = ? 
-            AND t.MULAI < MAKETIME(j.jam_angka + 1, 0, 0) 
-            AND t.SELESAI > MAKETIME(j.jam_angka, 0, 0)
-    )
-    SELECT 
-        CONCAT(LPAD(jam_angka, 2, '0'), ':00') AS label,
-        COALESCE(MAX(tgtQtyPJam), 0) AS target,
-        COALESCE(SUM(allocated_total), 0) AS actual,
-        COALESCE(SUM(allocated_ok), 0) AS actual_ok,
-        COALESCE(SUM(allocated_ng), 0) AS actual_ng,
-        CONCAT(COALESCE(MAX(itemName), '-'), ' (', COALESCE(MAX(operator), '-'), ')') AS extra_info
-    FROM raw_data
-    GROUP BY jam_angka
-    ORDER BY jam_angka ASC;
+		SELECT 
+			jam_ke AS label,
+			COALESCE(SUM(target_jam), 0) AS target,
+			COALESCE(SUM(qty_actual), 0) AS actual,
+			COALESCE(SUM(qty_actual) - SUM(qty_ng), 0) AS actual_ok,
+			COALESCE(SUM(qty_ng), 0) AS actual_ng,
+			COALESCE(MAX(item_name), '-') AS extra_info
+		FROM vtrx_lwp_prs
+		WHERE tanggal = ? AND mesin = ?
+		GROUP BY jam_ke
+		ORDER BY jam_ke ASC
 	`
 
 	if err := database.MySQL.Raw(query, tanggal, noMC).Scan(&results).Error; err != nil {
@@ -120,19 +118,20 @@ func GetMachineDetail(c *gin.Context) {
 	c.JSON(http.StatusOK, results)
 }
 
-// GetMachineList mengambil daftar semua mesin yang unik dari database
+// 4. GET LIST MESIN (Untuk Dropdown)
 func GetMachineList(c *gin.Context) {
-	// Cek koneksi DB
-	if database.MySQL == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "MySQL Offline"})
-		return
+	if !checkDB(c) { return }
+
+	tanggal := c.Query("tanggal")
+	if tanggal == "" {
+		tanggal = time.Now().Format("2006-01-02")
 	}
 
 	var machines []string
-	// Menggunakan DISTINCT untuk mendapatkan list mesin unik yang pernah beroperasi
-	query := "SELECT DISTINCT noMC FROM vtrx_lwp_prs ORDER BY noMC"
+	// Ambil list mesin unik yang aktif pada tanggal tersebut
+	query := "SELECT DISTINCT mesin FROM vtrx_lwp_prs WHERE tanggal = ? AND mesin != '' ORDER BY mesin"
 
-	if err := database.MySQL.Raw(query).Scan(&machines).Error; err != nil {
+	if err := database.MySQL.Raw(query, tanggal).Scan(&machines).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
