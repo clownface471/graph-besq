@@ -1,8 +1,9 @@
 package controllers
 
 import (
-	"graph/backend/database"
-	"graph/backend/models"
+	"dashboard-project/backend/database"
+	"dashboard-project/backend/models"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -18,107 +19,112 @@ func checkDB(c *gin.Context) bool {
 	return true
 }
 
+// Clause WHERE untuk merakit tanggal dari kolom thn, bln, tgl
+// Format DB: thn=2026, bln=2, tgl=9
+const whereDateClause = "CONCAT(t.thn, '-', LPAD(t.bln, 2, '0'), '-', LPAD(t.tgl, 2, '0')) = ?"
+
 // 1. MANAGER OVERVIEW
-// Karena tabel vtrx_lwp_prs kemungkinan besar khusus "Pressing",
-// kita hitung data dari tabel itu untuk divisi Pressing, sisanya 0 (kecuali ada tabel lain).
+// Menampilkan total output pabrik vs total target
 func GetManagerOverview(c *gin.Context) {
 	if !checkDB(c) { return }
 
-	tanggal := c.Query("tanggal")
+	tanggal := c.Query("tanggal") // Format: YYYY-MM-DD
 	var results []models.ChartSeries
 
-	// Query khusus untuk Pressing berdasarkan tabel vtrx_lwp_prs
-	// Asumsi: qty_actual adalah Total Output, target diambil dari kolom target_jam
-	query := `
+	var actualPressing models.ChartSeries
+	
+	// JOIN vtrx_lwp_prs (t) dengan v_stdlot (s)
+	// Menggunakan COLLATE agar aman jika collation DB beda
+	query := fmt.Sprintf(`
 		SELECT 
 			'PRESSING' AS label,
-			COALESCE(SUM(target_jam), 0) AS target,
-			COALESCE(SUM(qty_actual), 0) AS actual
-		FROM vtrx_lwp_prs 
-		WHERE tanggal = ?
-	`
-	// Kita buat variabel penampung sementara
-	var pressingData models.ChartSeries
+			COALESCE(SUM(s.tgtQtyPJam), 0) AS target,
+			COALESCE(SUM(t.Total), 0) AS actual
+		FROM vtrx_lwp_prs t
+		LEFT JOIN v_stdlot s ON t.moldcode = s.moldCode COLLATE utf8mb4_unicode_ci
+		WHERE %s
+	`, whereDateClause)
 	
-	if err := database.MySQL.Raw(query, tanggal).Scan(&pressingData).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	if err := database.MySQL.Raw(query, tanggal).Scan(&actualPressing).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal Query Manager: " + err.Error()})
 		return
 	}
+	actualPressing.Label = "PRESSING"
 
-	// Masukkan data Pressing, dan dummy 0 untuk divisi lain (karena belum ada tabelnya)
+	// Data Dummy untuk departemen lain
 	results = append(results, 
 		models.ChartSeries{Label: "MIXING", Target: 0, Actual: 0},
 		models.ChartSeries{Label: "CUTTING", Target: 0, Actual: 0},
-		pressingData, // Data Asli dari MySQL
+		actualPressing, // Data Real Pressing
 		models.ChartSeries{Label: "FINISHING", Target: 0, Actual: 0},
 	)
 
 	c.JSON(http.StatusOK, results)
 }
 
-// 2. LEADER / PROCESS VIEW (Detail per Mesin)
+// 2. LEADER / PROCESS VIEW (Detail per Mold/Mesin)
 func GetLeaderProcessView(c *gin.Context) {
 	if !checkDB(c) { return }
 
 	tanggal := c.Query("tanggal")
-	// proses := c.Query("proses") // Sementara diabaikan karena tabelnya cuma satu (PRS)
-
 	var results []models.ChartSeries
 
-	// Grouping berdasarkan kolom 'mesin'
-	query := `
+	// Grouping berdasarkan Mold
+	// Label: Nama Mold (moldName) atau Kode Mold (moldcode)
+	query := fmt.Sprintf(`
 		SELECT 
-			mesin AS label,
-			COALESCE(SUM(target_jam), 0) AS target,
-			COALESCE(SUM(qty_actual), 0) AS actual,
-			COALESCE(SUM(qty_ng), 0) AS actual_ng
-		FROM vtrx_lwp_prs
-		WHERE tanggal = ?
-		GROUP BY mesin
-		ORDER BY mesin
-	`
+			COALESCE(s.moldName, t.moldcode) AS label,
+			COALESCE(SUM(s.tgtQtyPJam), 0) AS target,
+			COALESCE(SUM(t.Total), 0) AS actual,
+			COALESCE(SUM(t.NG), 0) AS actual_ng
+		FROM vtrx_lwp_prs t
+		LEFT JOIN v_stdlot s ON t.moldcode = s.moldCode COLLATE utf8mb4_unicode_ci
+		WHERE %s
+		GROUP BY t.moldcode, s.moldName
+		ORDER BY label
+	`, whereDateClause)
 
 	if err := database.MySQL.Raw(query, tanggal).Scan(&results).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal Query Leader: " + err.Error()})
 		return
 	}
 
 	c.JSON(http.StatusOK, results)
 }
 
-// 3. MACHINE DETAIL (Detail per Jam)
+// 3. MACHINE DETAIL (Detail per Jam untuk 1 Mold)
 func GetMachineDetail(c *gin.Context) {
 	if !checkDB(c) { return }
 
 	tanggal := c.Query("tanggal")
-	noMC := c.Query("no_mc")
+	moldCode := c.Query("no_mc") // Parameter URL no_mc berisi moldcode
 	var results []models.ChartSeries
 
-	// Menggunakan kolom 'jam_ke' yang sudah ada di tabel, jauh lebih simpel!
-	// Kita asumsikan qty_actual adalah Total, jadi OK = Actual - NG.
-	query := `
+	// Detail Per Jam
+	query := fmt.Sprintf(`
 		SELECT 
-			jam_ke AS label,
-			COALESCE(SUM(target_jam), 0) AS target,
-			COALESCE(SUM(qty_actual), 0) AS actual,
-			COALESCE(SUM(qty_actual) - SUM(qty_ng), 0) AS actual_ok,
-			COALESCE(SUM(qty_ng), 0) AS actual_ng,
-			COALESCE(MAX(item_name), '-') AS extra_info
-		FROM vtrx_lwp_prs
-		WHERE tanggal = ? AND mesin = ?
-		GROUP BY jam_ke
-		ORDER BY jam_ke ASC
-	`
+			CONCAT(LPAD(t.jam, 2, '0'), ':00') AS label,
+			COALESCE(MAX(s.tgtQtyPJam), 0) AS target,
+			COALESCE(SUM(t.Total), 0) AS actual,
+			COALESCE(SUM(t.OK), 0) AS actual_ok,
+			COALESCE(SUM(t.NG), 0) AS actual_ng,
+			COALESCE(MAX(s.itemName), '-') AS extra_info
+		FROM vtrx_lwp_prs t
+		LEFT JOIN v_stdlot s ON t.moldcode = s.moldCode COLLATE utf8mb4_unicode_ci
+		WHERE %s AND t.moldcode = ?
+		GROUP BY t.jam
+		ORDER BY t.jam ASC
+	`, whereDateClause)
 
-	if err := database.MySQL.Raw(query, tanggal, noMC).Scan(&results).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	if err := database.MySQL.Raw(query, tanggal, moldCode).Scan(&results).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal Query Detail: " + err.Error()})
 		return
 	}
 
 	c.JSON(http.StatusOK, results)
 }
 
-// 4. GET LIST MESIN (Untuk Dropdown)
+// 4. GET LIST MESIN (List Mold yang Aktif)
 func GetMachineList(c *gin.Context) {
 	if !checkDB(c) { return }
 
@@ -128,13 +134,24 @@ func GetMachineList(c *gin.Context) {
 	}
 
 	var machines []string
-	// Ambil list mesin unik yang aktif pada tanggal tersebut
-	query := "SELECT DISTINCT mesin FROM vtrx_lwp_prs WHERE tanggal = ? AND mesin != '' ORDER BY mesin"
+	
+	// Mengambil daftar moldcode unik yang aktif hari ini
+	query := fmt.Sprintf(`
+		SELECT DISTINCT t.moldcode 
+		FROM vtrx_lwp_prs t
+		WHERE %s AND t.moldcode != '' 
+		ORDER BY t.moldcode
+	`, whereDateClause)
 
 	if err := database.MySQL.Raw(query, tanggal).Scan(&machines).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal List Mesin: " + err.Error()})
 		return
 	}
 
 	c.JSON(http.StatusOK, machines)
+}
+
+// --- DEBUG TOOL ---
+func CheckTableStructure(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"message": "Debug Tool Active"})
 }
