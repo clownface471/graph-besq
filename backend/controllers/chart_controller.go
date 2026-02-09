@@ -1,8 +1,8 @@
 package controllers
 
 import (
-	"dashboard-project/backend/database"
-	"dashboard-project/backend/models"
+	"graph/backend/database"
+	"graph/backend/models"
 	"fmt"
 	"net/http"
 	"time"
